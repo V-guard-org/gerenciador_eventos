@@ -140,7 +140,7 @@ def writer(data_dir):
 
 
 def test_abrupt_cut(rounds=10):
-    # ponytail: SIGKILL corta o processo, não a energia: valida a recuperação
+    # SIGKILL corta o processo, não a energia: valida a recuperação
     # do banco e das fotos, mas não o fsync. O corte real é puxar a fonte da
     # Raspberry com este writer rodando e depois conferir com check().
     data_dir = tempfile.mkdtemp()

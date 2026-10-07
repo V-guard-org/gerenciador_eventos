@@ -176,7 +176,7 @@ class Sync:
                 state = send("POST", "/telemetry", {"items": batch})
                 manager.ack_telemetry([item["id"] for item in batch], state)
 
-            # ponytail: a janela vai junto com os metadados, inclusive no 4G
+            # a janela vai junto com os metadados, inclusive no 4G
             # (~150 kB por evento com IMU a 100 Hz). Se pesar na franquia,
             # dar a ela um estado próprio e mandar só por Wi-Fi.
             for event in manager.pending_events():
@@ -185,7 +185,7 @@ class Sync:
                 manager.ack_event(event["id"], state)
 
             for event_id, path in manager.pending_photos():
-                # ponytail: reconfere o enlace a cada foto, mas se o Wi-Fi cair
+                # reconfere o enlace a cada foto, mas se o Wi-Fi cair
                 # entre a conferência e o envio, essa foto pode sair pelo 4G.
                 # Para garantia total, prender o socket à wlan0 (SO_BINDTODEVICE).
                 if self.link() != "wifi":

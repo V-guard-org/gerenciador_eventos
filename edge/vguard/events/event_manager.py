@@ -149,7 +149,7 @@ class EventManager:
             if ts - self._last_flush < TELEMETRY_INTERVAL:
                 return
 
-            # ponytail: consolida pela última amostra do intervalo; trocar por
+            # consolida pela última amostra do intervalo; trocar por
             # min/max/média da IMU quando RF34/RF35 (frenagem, impacto) entrarem.
             fresh = {
                 s: d for s, d in self._latest.items()
@@ -384,7 +384,7 @@ class EventManager:
         if self.storage_status()["level"] == "ok":
             return
 
-        # ponytail: apaga tudo que já foi sincronizado de uma vez; trocar por
+        # apaga tudo que já foi sincronizado de uma vez; trocar por
         # lotes do mais antigo ao mais novo se o histórico local for útil.
         done = "meta_synced = 1 AND (photo IS NULL OR photo_synced = 1)"
 
