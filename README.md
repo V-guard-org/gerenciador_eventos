@@ -1,6 +1,6 @@
 # V-GUARD — Gerenciador de Eventos
 
-Gerenciador de eventos local-first do projeto V-GUARD: grava no cartão SD a telemetria consolidada, os eventos e as fotografias, e mantém a fila do que ainda não foi confirmado pelo backend.
+Gerenciador de eventos local-first do projeto V-GUARD: grava no cartão SD a telemetria consolidada, os eventos e as fotografias, mantém a fila do que ainda não foi confirmado pelo backend e a envia por Wi-Fi ou 4G.
 
 Só usa a biblioteca padrão do Python (3.10+). Não há dependências a instalar.
 
@@ -20,14 +20,9 @@ manager.update("obd", {"rpm": 2100, "speed": 60})
 ok, buffer = cv2.imencode(".jpg", frame)
 event_id = manager.record_event("fadiga", score, buffer.tobytes())
 
-# Serviço de sincronização
-for event in manager.pending_events():          # 4G ou Wi-Fi
-    ...                                         # POST; se o backend confirmar:
-    manager.ack_event(event["id"])
-
-for event_id, path in manager.pending_photos(): # somente Wi-Fi
-    ...
-    manager.ack_photo(event_id)
+# Sincronização em segundo plano, no mesmo processo
+from sync import Sync
+Sync(manager).start()
 ```
 
 `update` e `record_event` aceitam `ts` (epoch, segundos). A Raspberry Pi não tem relógio de tempo real: sem rede o relógio do sistema pode estar errado, então prefira passar o horário do GPS.
@@ -41,6 +36,37 @@ dados/
 ```
 
 Cada evento tem dois estados independentes, `meta_synced` e `photo_synced`. Um evento enviado pelo 4G fica com os metadados confirmados e a foto pendente até o próximo Wi-Fi.
+
+## Sincronização
+
+`sync.py` roda um ciclo a cada `SYNC_INTERVAL`:
+
+| Enlace | O que envia |
+|---|---|
+| Wi-Fi autorizado | saúde, telemetria, eventos (com janela) e fotografias |
+| 4G | saúde, telemetria e eventos (com janela), sem fotografias |
+| nenhum | nada; tudo continua pendente |
+
+Estados de cada item:
+
+| Estado | Significado |
+|---|---|
+| `PENDING` (0) | ainda não confirmado; é reenviado até dar certo |
+| `CONFIRMED` (1) | o backend respondeu 2xx |
+| `FAILED` (2) | o backend recusou o dado (400, 413 ou 422); fica no SD, sai da fila |
+
+"Enviando" não é gravado: se a energia ou a rede caírem no meio, o item continua `PENDING` e é reenviado inteiro. Erro de rede, 5xx, 401 ou 404 interrompem o ciclo e o intervalo dobra a cada tentativa, até `RETRY_MAX`.
+
+O enlace é o que o kernel usa de fato para chegar ao backend (`ip route get`). Para o Wi-Fi ter precedência sobre o 4G, a métrica de rota do Wi-Fi precisa ser menor:
+
+```bash
+nmcli connection modify "<conexão 4G>" ipv4.route-metric 700
+nmcli connection modify "<conexão Wi-Fi>" ipv4.route-metric 100
+```
+
+Configuração no topo de `sync.py`: `AUTHORIZED_WIFI` (nomes das conexões Wi-Fi autorizadas), `CELLULAR_DEVICES`, `SYNC_INTERVAL` e `RETRY_MAX`. Endereço e credencial vêm do ambiente: `VGUARD_BACKEND`, `VGUARD_DEVICE` e `VGUARD_TOKEN`.
+
+O contrato com o backend é **provisório** e está descrito no topo de `sync.py`.
 
 ## Janela temporal do evento
 
@@ -81,9 +107,10 @@ Constantes no topo de `event_manager.py`, com valores iniciais a calibrar:
 ```bash
 cd edge/vguard/events
 python3 test_event_manager.py
+python3 test_sync.py              # contra um backend falso local
 ```
-
-O teste também mata um processo gravador com `SIGKILL` dez vezes seguidas e confere banco, fotos e fila a cada reabertura. Isso não é um corte de energia. Para o ensaio real na Raspberry:
+Por enquanto, o test_sync dará o resultado "WARNING:root:backend recusou /events/...: 422"
+O teste test_event_manager também mata um processo gravador com `SIGKILL` dez vezes seguidas e confere banco, fotos e fila a cada reabertura. Isso não é um corte de energia. Para o ensaio real na Raspberry:
 
 ```bash
 python3 test_event_manager.py writer /caminho/dados   # deixe rodando e puxe a fonte
@@ -92,6 +119,6 @@ python3 test_event_manager.py check /caminho/dados    # depois do boot
 
 ## Ainda não faz
 
-- Envio ao backend e seleção de enlace (serviço de sincronização).
+- Envio retomável de fotos: uma foto interrompida é reenviada inteira.
 - Rotação de logs (RNF23): o gerenciador não gera logs.
 - Com o SD cheio só de dados pendentes, `record_event` falha com erro do SQLite; não há tratamento além do nível `critical`.
