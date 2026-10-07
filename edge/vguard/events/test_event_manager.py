@@ -2,6 +2,7 @@
 Verificação do gerenciador de eventos. Executar:
 
     python test_event_manager.py
+    python3 test_event_manager.py
 """
 
 import os
@@ -58,12 +59,14 @@ def main():
     assert event["id"] == event_id and event["ts"] == 1015.0
     assert set(event["data"]) == {"imu", "gps"}
 
+    # Envio pelo 4G: metadados confirmados, foto continua pendente (RF18).
+    # A foto só entra na fila depois dos metadados.
+    assert manager.pending_photos() == []
+    manager.ack_event(event_id)
+
     (photo_id, path), = manager.pending_photos()
     assert photo_id == event_id
     assert open(path, "rb").read() == JPEG
-
-    # Envio pelo 4G: metadados confirmados, foto continua pendente (RF18).
-    manager.ack_event(event_id)
 
     # Queda de energia logo após um evento (sem close): a fila volta
     # como estava (RNF25) e o evento fica com a parte anterior da janela.

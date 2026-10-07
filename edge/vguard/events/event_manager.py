@@ -48,6 +48,13 @@ BUFFER_MAX_SAMPLES = 10000
 STORAGE_WARN = 0.80
 STORAGE_CRITICAL = 0.95
 
+# Estados de sincronização gravados nas colunas *synced. "Enviando" não
+# é gravado: se a energia cair no meio de um envio, o item simplesmente
+# continua PENDING.
+PENDING = 0
+CONFIRMED = 1   # o backend confirmou o armazenamento
+FAILED = 2      # o backend recusou em definitivo; fica no SD, sai da fila
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS telemetry (
@@ -268,7 +275,7 @@ class EventManager:
 
     # A fila É o banco: pendente = linha com synced = 0. Sobrevive a
     # reinicializações sem nenhum passo de recuperação (RNF25).
-    # Chamar ack_* somente após a confirmação do backend (RF22).
+    # Chamar ack_* somente após a resposta do backend (RF22).
 
     def pending_telemetry(self, limit=500):
         return self._query(
@@ -295,12 +302,14 @@ class EventManager:
     def pending_photos(self, limit=100):
         """
         Lista de (id do evento, caminho do JPEG). Somente Wi-Fi (RF21).
+
+        Só entram fotos cujos metadados o backend já confirmou.
         """
         with self._lock:
             rows = self._db.execute(
                 "SELECT id, photo FROM events"
                 " WHERE photo IS NOT NULL AND photo_synced = 0"
-                " ORDER BY ts LIMIT ?",
+                " AND meta_synced = 1 ORDER BY ts LIMIT ?",
                 (limit,)
             ).fetchall()
 
@@ -309,25 +318,25 @@ class EventManager:
             for r in rows
         ]
 
-    def ack_telemetry(self, ids):
+    def ack_telemetry(self, ids, state=CONFIRMED):
         with self._lock, self._db:
             self._db.executemany(
-                "UPDATE telemetry SET synced = 1 WHERE id = ?",
-                [(i,) for i in ids]
+                "UPDATE telemetry SET synced = ? WHERE id = ?",
+                [(state, i) for i in ids]
             )
 
-    def ack_event(self, event_id):
+    def ack_event(self, event_id, state=CONFIRMED):
         with self._lock, self._db:
             self._db.execute(
-                "UPDATE events SET meta_synced = 1 WHERE id = ?",
-                (event_id,)
+                "UPDATE events SET meta_synced = ? WHERE id = ?",
+                (state, event_id)
             )
 
-    def ack_photo(self, event_id):
+    def ack_photo(self, event_id, state=CONFIRMED):
         with self._lock, self._db:
             self._db.execute(
-                "UPDATE events SET photo_synced = 1 WHERE id = ?",
-                (event_id,)
+                "UPDATE events SET photo_synced = ? WHERE id = ?",
+                (state, event_id)
             )
 
     def pending_counts(self):
@@ -339,8 +348,8 @@ class EventManager:
                 "SELECT"
                 " (SELECT COUNT(*) FROM telemetry WHERE synced = 0),"
                 " (SELECT COUNT(*) FROM events WHERE meta_synced = 0),"
-                " (SELECT COUNT(*) FROM events"
-                "   WHERE photo IS NOT NULL AND photo_synced = 0)"
+                " (SELECT COUNT(*) FROM events WHERE photo IS NOT NULL"
+                "   AND photo_synced = 0 AND meta_synced != 2)"
             ).fetchone()
 
         return {"telemetry": row[0], "events": row[1], "photos": row[2]}
