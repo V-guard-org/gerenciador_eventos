@@ -54,6 +54,15 @@ As amostras de `update` passam por um buffer circular em memória com os último
 
 Se a energia cair no meio, o evento fica só com a parte anterior. Se os sensores pararem, a janela fecha sozinha após `2 × WINDOW_SECONDS`.
 
+## Armazenamento e recuperação
+
+- **Corte de energia:** o SQLite roda em WAL com `synchronous=FULL` e cada foto é gravada em arquivo temporário, sincronizada e só então renomeada. Um corte perde no máximo a gravação em andamento.
+- **Recuperação:** ao abrir, o gerenciador apaga de `photos/` o que não tem evento no banco (fotos pela metade, fotos de evento que não chegou a ser gravado) e fecha as janelas interrompidas. A fila volta como estava.
+- **Ocupação:** `storage_status()` devolve a fração usada do cartão e o nível `ok`, `warning` ou `critical`.
+- **Limpeza:** `cleanup()` não faz nada abaixo do alerta. A partir dele, apaga a telemetria e os eventos (com foto e janela) que o backend já confirmou por inteiro. O que está pendente nunca é apagado.
+
+`cleanup()` não roda sozinho: chame periodicamente, por exemplo a cada minuto.
+
 ## Configuração
 
 Constantes no topo de `event_manager.py`, com valores iniciais a calibrar:
@@ -64,6 +73,8 @@ Constantes no topo de `event_manager.py`, com valores iniciais a calibrar:
 | `EVENT_COOLDOWN` | 5 s | tempo mínimo entre dois eventos do mesmo tipo |
 | `WINDOW_SECONDS` | 10 s | telemetria preservada antes e depois de cada evento |
 | `BUFFER_MAX_SAMPLES` | 10000 | teto do buffer circular (folga para ~100 amostras/s) |
+| `STORAGE_WARN` | 0.80 | ocupação do SD que dispara o alerta e libera a limpeza |
+| `STORAGE_CRITICAL` | 0.95 | ocupação do SD considerada crítica |
 
 ## Teste
 
@@ -72,7 +83,15 @@ cd edge/vguard/events
 python3 test_event_manager.py
 ```
 
+O teste também mata um processo gravador com `SIGKILL` dez vezes seguidas e confere banco, fotos e fila a cada reabertura. Isso não é um corte de energia. Para o ensaio real na Raspberry:
+
+```bash
+python3 test_event_manager.py writer /caminho/dados   # deixe rodando e puxe a fonte
+python3 test_event_manager.py check /caminho/dados    # depois do boot
+```
+
 ## Ainda não faz
 
 - Envio ao backend e seleção de enlace (serviço de sincronização).
-- Limpeza de dados já sincronizados (RNF23): hoje nada é apagado do SD.
+- Rotação de logs (RNF23): o gerenciador não gera logs.
+- Com o SD cheio só de dados pendentes, `record_event` falha com erro do SQLite; não há tratamento além do nível `critical`.

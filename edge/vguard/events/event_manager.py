@@ -15,6 +15,7 @@ import collections
 import json
 import math
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -41,6 +42,11 @@ WINDOW_SECONDS = 10.0
 # Teto do buffer circular, caso o relógio salte para trás e a poda
 # por tempo pare de funcionar. Folga para ~100 amostras/s.
 BUFFER_MAX_SAMPLES = 10000
+
+# Ocupação do cartão SD (fração de 0 a 1) que dispara o alerta e o
+# estado crítico (RNF22). A limpeza só atua a partir do alerta.
+STORAGE_WARN = 0.80
+STORAGE_CRITICAL = 0.95
 
 
 SCHEMA = """
@@ -78,6 +84,7 @@ CREATE INDEX IF NOT EXISTS event_window_event ON event_window (event_id, ts);
 class EventManager:
 
     def __init__(self, data_dir="dados"):
+        self.data_dir = data_dir
         self.photo_dir = os.path.join(data_dir, "photos")
         os.makedirs(self.photo_dir, exist_ok=True)
 
@@ -100,6 +107,8 @@ class EventManager:
             self._db.execute(
                 "UPDATE events SET window_closed = 1 WHERE window_closed = 0"
             )
+
+        self._remove_orphans()
 
         # Buffer circular: (ts, fonte, amostra) dos últimos WINDOW_SECONDS.
         self._buffer = collections.deque(maxlen=BUFFER_MAX_SAMPLES)
@@ -335,6 +344,67 @@ class EventManager:
             ).fetchone()
 
         return {"telemetry": row[0], "events": row[1], "photos": row[2]}
+
+    # --------------------------------------------------------
+    # ARMAZENAMENTO
+    # --------------------------------------------------------
+
+    def storage_status(self):
+        """
+        Ocupação do cartão SD, para a saúde do dispositivo (RF32).
+        """
+        usage = shutil.disk_usage(self.data_dir)
+        used = usage.used / usage.total
+
+        if used >= STORAGE_CRITICAL:
+            level = "critical"
+        elif used >= STORAGE_WARN:
+            level = "warning"
+        else:
+            level = "ok"
+
+        return {"used": used, "free_bytes": usage.free, "level": level}
+
+    def cleanup(self):
+        """
+        Abaixo de STORAGE_WARN não faz nada. A partir dele, apaga o que o
+        backend já confirmou; o que está pendente nunca é apagado (RNF23).
+
+        Chamar periodicamente (ex.: a cada minuto).
+        """
+        if self.storage_status()["level"] == "ok":
+            return
+
+        # ponytail: apaga tudo que já foi sincronizado de uma vez; trocar por
+        # lotes do mais antigo ao mais novo se o histórico local for útil.
+        done = "meta_synced = 1 AND (photo IS NULL OR photo_synced = 1)"
+
+        with self._lock:
+            with self._db:
+                self._db.execute("DELETE FROM telemetry WHERE synced = 1")
+                self._db.execute(
+                    "DELETE FROM event_window WHERE event_id IN"
+                    " (SELECT id FROM events WHERE " + done + ")"
+                )
+                self._db.execute("DELETE FROM events WHERE " + done)
+
+            # As fotos desses eventos ficaram sem linha no banco.
+            self._remove_orphans()
+
+    def _remove_orphans(self):
+        """
+        Apaga arquivos em photos/ sem evento no banco: gravações
+        interrompidas (.tmp), fotos cujo evento não chegou a ser gravado
+        e fotos de eventos removidos pela limpeza.
+        """
+        known = {
+            row[0] for row in
+            self._db.execute("SELECT photo FROM events WHERE photo IS NOT NULL")
+        }
+
+        for name in os.listdir(self.photo_dir):
+            if name not in known:
+                os.remove(os.path.join(self.photo_dir, name))
 
     # --------------------------------------------------------
 
