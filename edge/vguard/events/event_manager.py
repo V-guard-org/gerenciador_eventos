@@ -11,7 +11,9 @@ Quem escreve: visão (record_event) e leitores de GPS / ESP32 (update).
 Quem lê: o serviço de sincronização (pending_* / ack_*).
 """
 
+import collections
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -32,8 +34,13 @@ TELEMETRY_INTERVAL = 1.0
 # geraria um evento por frame enquanto os olhos estiverem fechados.
 EVENT_COOLDOWN = 5.0
 
-# Janela de telemetria antes/depois do evento (RF17).
+# Janela de telemetria antes/depois do evento (RF17), na frequência
+# original dos sensores.
 WINDOW_SECONDS = 10.0
+
+# Teto do buffer circular, caso o relógio salte para trás e a poda
+# por tempo pare de funcionar. Folga para ~100 amostras/s.
+BUFFER_MAX_SAMPLES = 10000
 
 
 SCHEMA = """
@@ -54,8 +61,17 @@ CREATE TABLE IF NOT EXISTS events (
     data         TEXT NOT NULL,
     photo        TEXT,
     meta_synced  INTEGER NOT NULL DEFAULT 0,
-    photo_synced INTEGER NOT NULL DEFAULT 0
+    photo_synced INTEGER NOT NULL DEFAULT 0,
+    window_closed INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS event_window (
+    event_id TEXT NOT NULL REFERENCES events (id),
+    ts       REAL NOT NULL,
+    source   TEXT NOT NULL,
+    data     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS event_window_event ON event_window (event_id, ts);
 """
 
 
@@ -78,6 +94,17 @@ class EventManager:
         self._db.execute("PRAGMA synchronous=FULL")
         self._db.executescript(SCHEMA)
 
+        # Janelas interrompidas por queda de energia não serão mais
+        # completadas: ficam só com a parte anterior ao evento.
+        with self._db:
+            self._db.execute(
+                "UPDATE events SET window_closed = 1 WHERE window_closed = 0"
+            )
+
+        # Buffer circular: (ts, fonte, amostra) dos últimos WINDOW_SECONDS.
+        self._buffer = collections.deque(maxlen=BUFFER_MAX_SAMPLES)
+        self._open = {}         # id -> (ts do evento, prazo monotônico)
+
         self._latest = {}       # fonte -> última amostra
         self._last_flush = 0.0
         self._last_event = {}   # tipo -> ts do último evento
@@ -97,6 +124,11 @@ class EventManager:
 
         with self._lock:
             self._latest[source] = {"ts": ts, **data}
+
+            self._buffer.append((ts, source, data))
+            self._close_windows(ts)
+            while self._buffer[0][0] < ts - WINDOW_SECONDS:
+                self._buffer.popleft()
 
             if ts - self._last_flush < TELEMETRY_INTERVAL:
                 return
@@ -141,13 +173,18 @@ class EventManager:
                 photo = event_id + ".jpg"
                 self._write_photo(photo, jpeg)
 
+            # A parte anterior da janela entra na mesma transação do
+            # evento: sobrevive mesmo se a energia cair logo em seguida.
             with self._db:
                 self._db.execute(
                     "INSERT INTO events (id, type, ts, score, data, photo)"
                     " VALUES (?, ?, ?, ?, ?, ?)",
                     (event_id, type, ts, score, json.dumps(self._latest), photo)
                 )
+                self._insert_window(event_id, ts - WINDOW_SECONDS, ts)
 
+            # Se os sensores pararem, a janela fecha pelo prazo.
+            self._open[event_id] = (ts, time.monotonic() + 2 * WINDOW_SECONDS)
             self._last_event[type] = ts
             return event_id
 
@@ -166,15 +203,54 @@ class EventManager:
         os.fsync(fd)
         os.close(fd)
 
-    def window(self, event_id, seconds=WINDOW_SECONDS):
+    # --------------------------------------------------------
+    # JANELA TEMPORAL
+    # --------------------------------------------------------
+
+    def _insert_window(self, event_id, start, end):
         """
-        Telemetria de `seconds` antes até `seconds` depois do evento.
+        Copia do buffer para o SD as amostras com start <= ts <= end.
+        """
+        self._db.executemany(
+            "INSERT INTO event_window VALUES (?, ?, ?, ?)",
+            [
+                (event_id, ts, source, json.dumps(data))
+                for ts, source, data in self._buffer
+                if start <= ts <= end
+            ]
+        )
+
+    def _close_windows(self, ts):
+        """
+        Grava a parte posterior das janelas que já terminaram em `ts`.
+        """
+        now = time.monotonic()
+
+        for event_id, (event_ts, deadline) in list(self._open.items()):
+            end = event_ts + WINDOW_SECONDS
+
+            if ts <= end and now < deadline:
+                continue
+
+            with self._db:
+                # nextafter: a amostra do instante do evento já foi gravada.
+                self._insert_window(
+                    event_id, math.nextafter(event_ts, math.inf), end
+                )
+                self._db.execute(
+                    "UPDATE events SET window_closed = 1 WHERE id = ?",
+                    (event_id,)
+                )
+            del self._open[event_id]
+
+    def window(self, event_id):
+        """
+        Amostras de WINDOW_SECONDS antes até WINDOW_SECONDS depois do evento.
         """
         return self._query(
-            "SELECT t.id, t.ts, t.data FROM telemetry t, events e"
-            " WHERE e.id = ? AND t.ts BETWEEN e.ts - ? AND e.ts + ?"
-            " ORDER BY t.ts",
-            (event_id, seconds, seconds)
+            "SELECT ts, source, data FROM event_window"
+            " WHERE event_id = ? ORDER BY ts",
+            (event_id,)
         )
 
     # --------------------------------------------------------
@@ -195,10 +271,15 @@ class EventManager:
     def pending_events(self, limit=100):
         """
         Metadados pendentes. Podem ir por 4G ou Wi-Fi (RF20).
+
+        Um evento só entra na fila depois que sua janela fecha.
         """
+        with self._lock:
+            self._close_windows(float("-inf"))
+
         return self._query(
             "SELECT id, type, ts, score, data FROM events"
-            " WHERE meta_synced = 0 ORDER BY ts LIMIT ?",
+            " WHERE meta_synced = 0 AND window_closed = 1 ORDER BY ts LIMIT ?",
             (limit,)
         )
 
@@ -267,4 +348,6 @@ class EventManager:
         ]
 
     def close(self):
+        with self._lock:
+            self._close_windows(float("inf"))
         self._db.close()

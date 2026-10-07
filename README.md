@@ -36,11 +36,23 @@ for event_id, path in manager.pending_photos(): # somente Wi-Fi
 
 ```
 dados/
-├── vguard.db          # SQLite: tabelas telemetry e events
+├── vguard.db          # SQLite: tabelas telemetry, events e event_window
 └── photos/<id>.jpg    # fotografia do evento, nomeada pelo id
 ```
 
 Cada evento tem dois estados independentes, `meta_synced` e `photo_synced`. Um evento enviado pelo 4G fica com os metadados confirmados e a foto pendente até o próximo Wi-Fi.
+
+## Janela temporal do evento
+
+As amostras de `update` passam por um buffer circular em memória com os últimos `WINDOW_SECONDS`, na frequência original dos sensores. Ao registrar um evento:
+
+1. a parte anterior da janela é gravada na mesma transação do evento;
+2. a parte posterior é gravada quando chega a primeira amostra depois de `WINDOW_SECONDS`;
+3. só então o evento aparece em `pending_events()`.
+
+`manager.window(event_id)` devolve as amostras gravadas (`ts`, `source`, `data`).
+
+Se a energia cair no meio, o evento fica só com a parte anterior. Se os sensores pararem, a janela fecha sozinha após `2 × WINDOW_SECONDS`.
 
 ## Configuração
 
@@ -50,7 +62,8 @@ Constantes no topo de `event_manager.py`, com valores iniciais a calibrar:
 |---|---|---|
 | `TELEMETRY_INTERVAL` | 1 s | intervalo de consolidação da telemetria gravada |
 | `EVENT_COOLDOWN` | 5 s | tempo mínimo entre dois eventos do mesmo tipo |
-| `WINDOW_SECONDS` | 10 s | telemetria antes/depois do evento retornada por `window()` |
+| `WINDOW_SECONDS` | 10 s | telemetria preservada antes e depois de cada evento |
+| `BUFFER_MAX_SAMPLES` | 10000 | teto do buffer circular (folga para ~100 amostras/s) |
 
 ## Teste
 
